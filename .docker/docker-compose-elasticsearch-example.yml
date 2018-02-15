@@ -1,0 +1,20 @@
+version: "3"
+services:
+  elasticsearch:
+    image: vortexcommerce/elasticsearch:1.5.2
+    volumes:
+      - ./data/elasticsearch:/usr/share/elasticsearch/data
+    networks:
+      backend:
+        aliases:
+          - elasticsearch
+      frontend:
+        aliases:
+          - elasticsearch
+    environment:
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1

@@ -1,0 +1,27 @@
+version: "3"
+services:
+  nginx:
+    networks:
+      backend:
+    volumes:
+      - ./config/nginx/sites-enabled/default-varnish.conf.template:/etc/nginx/conf.d/default.conf
+  varnish:
+    image: vortexcommerce/varnish:4
+    networks:
+      backend:
+        aliases:
+          - varnish
+      frontend:
+        aliases:
+          - varnish
+    environment:
+      VARNISH_BACKEND_HOST: "nginx"
+      VARNISH_BACKEND_PORT: "8888"
+    volumes:
+      - ./logs/varnish:/var/log/varnish
+      - ../.docker-config/varnish/reload.sh:/etc/varnish/reload.sh
+      - ../.docker-config/varnish/default.vcl:/etc/varnish/default.vcl
+    depends_on:
+      - nginx
+    links:
+      - nginx

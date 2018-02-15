@@ -1,0 +1,3 @@
+[submodule "docker-images/php"]
+	path = docker-images/php
+	url = git@github.com:VortexCommerce/docker-images-php.git

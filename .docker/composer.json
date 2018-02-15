@@ -1,0 +1,44 @@
+{
+  "name": "vortexcommerce/project-setup",
+  "description": "VortexCommerec Mage1/Mage2 Project setup ",
+  "homepage": "https://github.com/VortexCommerce/ProjectSetup",
+  "require": {
+    "aoepeople/aoe_scheduler": "v0.4.3",
+    "aschroder/smtp_pro": "v2.0.5",
+    "gordonlesti/lesti_fpc": "1.3.6",
+    "jeroenvermeulen/solarium": "v1.6.9-beta",
+    "aydin-hassan/magento-core-composer-installer": "*",
+    "colinmollenhour/modman": "*",
+    "theseer/autoload": "*",
+    "magento/core": "1.9.2.4"
+  },
+  "require-dev": {
+    "aoepeople/aoe_profiler": "v0.3.0",
+    "aoepeople/aoe_templatehints": "v0.4.1",
+    "avstudnitz/scopehint": "dev-master#9fd3eb0978fa67b55f5756494569746119f3f2f6",
+    "tim-reynolds/magento-qconfig": "1.0"
+  },
+  "repositories": [
+    {
+      "type": "composer",
+      "url": "https://packages.firegento.com"
+    }
+  ],
+  "extra": {
+    "magento-root-dir": "web",
+    "auto-append-gitignore": true
+  },
+  "config": {
+    "discard-changes": true,
+    "secure-http" : false
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "scripts": {
+    "post-install-cmd": [
+    ],
+    "post-update-cmd": [
+    ]
+  }
+
+}

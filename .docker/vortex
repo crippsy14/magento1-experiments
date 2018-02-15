@@ -1,0 +1,909 @@
+#!/bin/bash
+#
+# A control-script for managing the docker-infrastructure components for Magento
+
+# The first parameter is the action name
+action=$1
+
+# All other arguments are parameters
+if [ "$#" -gt "1" ]; then
+shift
+parameters=$@
+fi
+
+
+# Paths
+SCRIPTNAME=`basename $0`
+SCRIPTPATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+if [ -d "$SCRIPTPATH/.docker" ]; then
+    SCRIPTPATH+="/.docker"
+fi
+
+if [ "$?" != 0 ]; then
+    if [ ! -f "docker-compose.yml" ]; then
+        >&2 echo " The $SCRIPTNAME-script will only work (on Mac OS) if you execute it from the project directory itself."
+        exit 1
+    fi
+    SCRIPTPATH="$(pwd -P)/$SCRIPTNAME"
+fi
+if [ ! `basename $SCRIPTPATH` == '.docker' ]; then
+    PROJECTPATH="$SCRIPTPATH/web"
+    PROJECTNAME=`basename $SCRIPTPATH`
+else
+    PROJECTPATH=$(dirname "$SCRIPTPATH")
+    PROJECTNAME=`basename $PROJECTPATH`
+fi
+
+PROJECTNAME=$(echo "$PROJECTNAME" | tr -dc '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+
+# Platform detection
+platform='unknown'
+unamestr=`uname`
+if [[ "$unamestr" == 'Linux' ]]; then
+   platform='linux'
+elif [[ "$unamestr" == 'FreeBSD' ]]; then
+   platform='freebsd'
+fi
+
+# Magento Version Detection
+if [ -f $PROJECTPATH/bin/magento ];
+then
+    MAGENTOVERSION=2
+else
+    MAGENTOVERSION=1
+fi
+
+# Mandatory Tools
+COMPOSER=`which composer`
+DOCKER=`which docker`
+if [ -z "$DOCKER" ];
+then
+    echo "'docker' was not found on your system." >&2
+    exit 1
+fi
+
+DOCKERCOMPOSE=`which docker-compose`
+if [ -z "$DOCKERCOMPOSE" ];
+then
+    echo "'docker-compose' was not found on your system." >&2
+    exit 1
+fi
+
+DOCKERCOMPOSE+=" --project-name $PROJECTNAME"
+
+if [ -f "$SCRIPTPATH/docker-compose.yml" ]; then
+    DOCKERCOMPOSE+=" -f $SCRIPTPATH/docker-compose.yml"
+fi
+
+#if [ -f "$SCRIPTPATH/docker-compose-test.yml" ]; then
+#    DOCKERCOMPOSE+=" -f $SCRIPTPATH/docker-compose-test.yml"
+#fi
+
+# Switch into the project directory
+cd $PROJECTPATH
+
+if [ -f ".docker-compose-override.yml" ]; then
+    DOCKERCOMPOSE+=" -f .docker-compose-override.yml"
+fi
+
+webHostName="$PROJECTNAME.local.com";
+mysqlHostName="$PROJECTNAME-mysql.local.com"
+
+# Utils
+XARGS=`which xargs`
+GREP=`which grep`
+SED=`which sed`
+
+#########################################################################
+# Get the full container name for the given container type (e.g. "php")
+# Arguments:
+#  CONTAINER_TYPE
+# Returns:
+#  The full name of the (first) container with the given type
+#########################################################################
+getContainerNameByType() {
+    # abort if no type is specified
+    local CONTAINER_TYPE="$1"
+    if [ -z "$CONTAINER_TYPE" ];
+    then
+        echo "No container type specified. Please specifiy a container type (e.g. php, installer, mysql, nginx, ...)."  >&2
+        return 1
+    fi
+
+    # check if xargs is available
+    if [ -z "$XARGS" ];
+    then
+        echo "The tool 'xargs' was not found on your system." >&2
+        return 1
+    fi
+
+    # check if grep is available
+    if [ -z "$GREP" ];
+    then
+        echo "The tool 'grep' was not found on your system." >&2
+        return 1
+    fi
+
+    # check if sed is available
+    if [ -z "$SED" ];
+    then
+        echo "The tool 'sed' was not found on your system." >&2
+        return 1
+    fi
+    local containerName=$($DOCKER ps -q | $XARGS $DOCKER inspect --format '{{.Name}}' | $GREP "$CONTAINER_TYPE" | $GREP "$PROJECTNAME" | $SED 's:/::')
+    echo $containerName
+    return 0
+}
+
+executeComposer() {
+    local containerType="php"
+    local containerName=$(getContainerNameByType $containerType)
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+
+    bash -c $containerName -u www-data -r "composer --working-dir=\"/var/www/html\" $@"
+    return 0
+}
+
+enterContainer() {
+    local containerType="$1"
+    if [ -z "$containerType" ];
+    then
+        echo "No container type specified. Please specifiy a container type (e.g. php, installer, mysql, nginx, ...)."  >&2
+        return 1
+    fi
+
+    local containerName=$(getContainerNameByType $containerType)
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+
+    bash -c $containerName
+    return 0
+}
+
+executeMagerun() {
+    local containerType="php"
+    local containerName=$(getContainerNameByType "$containerType")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    if [ $MAGENTOVERSION == "2" ];
+    then
+        URL='https://files.magerun.net/n98-magerun2.phar'
+    else
+        URL='https://files.magerun.net/n98-magerun.phar'
+    fi
+    COMMAND="magerun --version >/dev/null 2>&1 || { echo >&2 'magerun needs to be installed, installing now...'; curl $URL -o /usr/local/bin/magerun; chmod +x /usr/local/bin/magerun; chown root:root /usr/local/bin/magerun; }"
+    bash -c $containerName -r "$COMMAND"
+    bash -c $containerName -u www-data -r "magerun --skip-root-check --root-dir=\"/var/www/html\" $@"
+    return 0
+}
+
+bash() {
+
+    _user=""
+    _containerName=""
+    _run=""
+    _env=""
+
+    PARSED_OPTIONS=$(getopt -n "$0" -o :u:r:c:e: -l ":container:run:user:env:" -- "$@")
+
+    if [ $? -ne 0 ];
+    then
+        exit 1
+    fi
+
+    eval set -- "$PARSED_OPTIONS"
+
+    while true ; do
+        case "$1" in
+            -u|--user)
+                _user="--user $2"; shift 2 ;;
+            -r|--run)
+                _command="$2"; shift 2 ;;
+            -e|--env)
+                _env="$2"; shift 2 ;;
+            -c|--container)
+                _containerName="$2"; shift 2 ;;
+            --) shift ; break ;;
+            *) echo "Internal error!" ; exit 1 ;;
+        esac
+    done
+
+    COLUMNS=`tput cols`
+    LINES=`tput lines`
+
+    BASH="$DOCKER exec -t -i $_user $_containerName env COLUMNS=$COLUMNS LINES=$LINES $_env bash";
+
+    if [[ $_command ]]; then
+        $BASH -c "$_command"
+    else
+        $BASH
+    fi
+
+}
+
+enterFakeAccessServer() {
+
+    xdebug=false
+
+    for arg in "$@"; do
+        shift
+        case "$arg" in
+            "--xdebug")     set -- "$@" "-x" ;;
+            *)              set -- "$@" "$arg"
+        esac
+    done
+    while getopts ":x" OPTION; do
+        case "$OPTION" in
+        x)
+            xdebug=true
+            ;;
+        esac
+    done
+
+    local containerName=$(getContainerNameByType "php")
+        if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+
+    if $xdebug; then
+        bash -c $containerName -u www-data -e PHP_IDE_CONFIG="serverName=default"
+    else
+        bash -c $containerName -u www-data
+
+    fi
+    return 0
+}
+
+executePHPUnit() {
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    bash -c $containerName -u www-data -r MagiumMagentoExample/tests/phpunit.xml.dist
+}
+
+executeInitSampleData() {
+    local containerName=$(getContainerNameByType "mysql")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    which mktemp >/dev/null 2>&1
+    [ $? -eq 0 ] && TMP_FILE=$(mktemp "$PROJECTPATH/var/local.xml.XXXXX") || TMP_FILE="$PROJECTPATH/var/.tmp.local.xml"
+    sed -ne '/default_setup/,/\/default_setup/p' "$PROJECTPATH/app/etc/local.xml" > $TMP_FILE
+
+    DBHOST=$(grep -Eoh "<host>(<!\[CDATA\[)?(.*)(\]\]>)?<\/host>" $TMP_FILE | sed "s#<host><!\[CDATA\[##g;s#\]\]><\/host>##g")
+    DBUSER=$(grep -Eoh "<username>(<!\[CDATA\[)?(.*)(\]\]>)?<\/username>" $TMP_FILE | sed "s#<username><!\[CDATA\[##g;s#\]\]><\/username>##g")
+    DBNAME=$(grep -Eoh "<dbname>(<!\[CDATA\[)?(.*)(\]\]>)?<\/dbname>" $TMP_FILE | sed "s#<dbname><!\[CDATA\[##g;s#\]\]><\/dbname>##g")
+    DBPASS=$(grep -Eoh "<password>(<!\[CDATA\[)?(.*)(\]\]>)?<\/password>" $TMP_FILE | sed "s#<password><!\[CDATA\[##g;s#\]\]><\/password>##g")
+    DBPASS=$(echo "$DBPASS" | sed 's/"/\\\"/g')
+    [ -f $TMP_FILE ] && rm $TMP_FILE
+    bash -c $containerName -r "rm -Rf ~/magento-sample-data-* \
+        && curl -o ~/magento-sample-data-1.9.2.4.tar.bz2 http://downloads.d.vortexcommerce.com/magento-sample-data-1.9.2.4.tar.bz2 \
+        && pv -brapt ~/magento-sample-data-1.9.2.4.tar.bz2 | tar -xjf - -C ~/ \
+        && cp -R ~/magento-sample-data-1.9.2.4/media/* /var/www/html/media/ \
+        && pv -brapt ~/magento-sample-data-1.9.2.4/*.sql | mysql -f -h $DBHOST -u $DBUSER -p"$DBPASS" $DBNAME \
+        && chown -Rf root:www-data /var/www/html/media/ \
+        && rm -Rf /tmp/magento-sample-data-*"
+}
+
+executePHP() {
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    bash -c $containerName -u www-data -r "$@"
+    return 1;
+}
+
+executeXdebug() {
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    if [[ ("$@" && ("$@" == "enable" || "$@" == "start" ) ) ]];
+    then
+        if [[ ($platform == 'linux') ]];
+        then
+            if [[ !(`ip addr show | awk '/inet 10.254.254.254/ {print $2}'`) ]];
+            then
+                echo "Adding a loopback alias for 10.254.254.254\n"
+                sudo ifconfig lo:0 10.254.254.254 netmask 255.255.255.0 up
+            fi
+        fi
+        bash -c $containerName -r "[[ -f /usr/local/etc/php/conf.d/ext-xdebug.ini ]] \
+            && echo 'Xdebug already enabled' || (ln -sf /usr/local/etc/php/conf.d/ext-xdebug.ini.disabled /usr/local/etc/php/conf.d/ext-xdebug.ini \
+            && kill -USR2 1 \
+            && : > /var/log/php/xdebug.log \
+            && chmod -f g+rw /var/log/php/xdebug.log \
+            && chown -f www-data:www-data /var/log/php/xdebug.log \
+            && echo 'Xdebug has been enabled')"
+    elif [[ ("$@" && ("$@" == "disable" || "$@" == "stop")) ]];
+    then
+        bash -c $containerName -r "[[ ! -f /usr/local/etc/php/conf.d/ext-xdebug.ini ]] \
+            && echo 'Xdebug already disabled' || (rm /usr/local/etc/php/conf.d/ext-xdebug.ini \
+            && kill -USR2 1 \
+            && echo 'Xdebug has been disabled')"
+    else
+        bash -c $containerName -r "[[ -f /usr/local/etc/php/conf.d/ext-xdebug.ini ]] \
+        && echo 'Xdebug is enabled' || echo 'Xdebug is disabled'"
+    fi
+    return 0
+}
+
+enterXdebug() {
+    local containerName=$(getContainerNameByType "php")
+        if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    bash -c $containerName -u www-data -e "PHP_IDE_CONFIG=serverName=default"
+}
+
+testBuild() {
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    bash -c $containerName -u www-data -r "[[ ! -f /usr/local/etc/php/conf.d/ext-xdebug.ini ]] \
+        && echo 'Must be Magento 2 to run this command' || \
+        php bin/magento cache:flush \
+        && php bin/magento setup:upgrade \
+        && php bin/magento setup:di:compile \
+        && php bin/magento deploy:mode:set production \
+        && php bin/magento cache:flush \
+        && php bin/magento cache:enable \
+        && php bin/magento indexer:reindex"
+}
+
+executeProjectInit()
+{
+    PARSED_OPTIONS=$(getopt -n "$0" -o r: -l "require:" -- "$@")
+
+    eval set -- "$PARSED_OPTIONS"
+
+    if [ -f 'composer.json' ]; then
+        echo "Project already initialised as the composer.json file already exists";
+        while true; do
+            read -p "Do you wish to reinitilise? [Y/n]" yn
+            case $yn in
+                [Yy]* ) break;;
+                [Nn]* ) exit 1;;
+                * ) echo "Please answer [Y/n].";;
+            esac
+        done
+    fi
+
+    # Workaround as composer will not allow project setup unless directory is empty, however this is impossible due to git
+    $COMPOSER create-project \
+        --no-install \
+        --repository-url=https://repo.magento.com/ \
+         magento/project-community-edition magento
+    rsync -avz ./magento/ ./
+    rm -Rf ./magento/
+
+    # Add the Vortex private Packagist repo
+    $COMPOSER config repositories.vortex composer https://repo.packagist.com/vortexcommerce/
+    $COMPOSER config repo.packagist false
+
+    $COMPOSER update
+
+    # Require dependencies
+    while true ; do
+        case "$1" in
+            -r|--require)
+                for package in $2; do
+                    echo "Requiring Package: $package"
+                    $COMPOSER require "$package"
+                done
+                shift 2 ;;
+            --) shift ; break ;;
+            *) echo "Internal error!" ; exit 1 ;;
+        esac
+    done
+
+    printf "$(tput setaf 2)Successfully created your composer project: \n"
+    tput sgr0
+    cat composer.json
+}
+
+projectInit()
+{
+    executeProjectInit $parameters;
+}
+
+executeMagentoInstall()
+{
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+
+    default=false
+    for arg in "$@"; do
+        shift
+        echo $arg
+        case "$arg" in
+            '--default')
+                default=true
+                ;;
+        esac
+    done
+
+    if $default; then
+        adminfirstname='admin'
+        adminlastname='admin'
+        adminemail='admin@vortexcommerce.com'
+        adminuser='admin'
+        adminpass='admin123'
+    else
+        read -p "Admin firstname [default: admin]: " adminfirstname
+        if [ -z $adminfirstname ]; then
+            adminfirstname='admin'
+        fi
+
+        read -p "Admin lastname [default: admin]: " adminlastname
+        if [ -z $adminlastname ]; then
+            adminlastname='admin'
+        fi
+
+        read -p "Admin email [default: admin@vortexcommerce.com]: " adminemail
+        if [ -z $adminemail ]; then
+            adminemail='admin@vortexcommerce.com'
+        fi
+
+        read -p "Admin user [default: admin]: " adminuser
+        if [ -z $adminuser ]; then
+            adminuser='admin'
+        fi
+
+        read -p "Admin password [default: admin123]: " adminpass
+        if [ -z $adminpass ]; then
+            adminpass='admin123'
+        fi
+    fi
+
+    CMD="php bin/magento setup:install \
+        --base-url='https://$webHostName/' \
+        --base-url-secure='https://$webHostName/' \
+        --db-host='mysql' \
+        --db-name='magento' \
+        --db-user='magento' \
+        --db-password='magento' \
+        --admin-firstname='$adminfirstname' \
+        --admin-lastname='$adminlastname' \
+        --admin-email='$adminemail' \
+        --admin-user='$adminuser' \
+        --admin-password='$adminpass' \
+        --language='en_GB' \
+        --currency='GBP' \
+        --timezone='Europe/London' \
+        --use-rewrites='1' \
+        --use-secure='1' \
+        --use-secure-admin=1 \
+        --session-save='redis' \
+        --session-save-redis-host='sessions' \
+        --admin-use-security-key='1' \
+        --cache-backend='redis' \
+        --cache-backend-redis-server='cache' \
+        --page-cache='redis' \
+        --http-cache-hosts='varnish' \
+        --page-cache-redis-server='fullpagecache' \
+        --backend-frontname='admin' \
+        && php bin/magento config:set system/full_page_cache/varnish/backend_host varnish \
+        && php bin/magento config:set system/full_page_cache/varnish/backend_port 80 \
+        && php bin/magento deploy:mode:set developer";
+
+    bash -c $containerName -u www-data -r "$CMD"
+
+}
+
+magentoInstall()
+{
+    executeMagentoInstall $parameters;
+}
+
+executePhpcs() {
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+    CMD="phpcs $@";
+    bash -c $containerName -u www-data -r "$CMD"
+}
+
+executeMysqlClient()
+{
+    mysql -uroot -pmagento -h"$PROJECTNAME-mysql.local.com" magento $@
+}
+
+_start() {
+    NETWORKS=$($DOCKER  network ls | grep "$PROJECTNAME" | awk '/ / { print $1 }')
+    if [ -n "$NETWORKS" ]; then
+        $DOCKER network rm $NETWORKS
+    fi
+    UP="$DOCKERCOMPOSE up"
+    DEBUG=false
+    NOCACHE=false
+    for arg in "$@"; do
+        shift
+        case "$arg" in
+            "--debug")      set -- "$@" "-d" ;;
+            "--nocache")    set -- "$@" "-n" ;;
+            *)              set -- "$@" "$arg"
+        esac
+    done
+    while getopts ":dn" OPTION; do
+        case "$OPTION" in
+        d)
+            DEBUG=true
+            ;;
+        n)
+            $DOCKERCOMPOSE pull
+            $DOCKERCOMPOSE build --no-cache
+            UP="$UP --force-recreate"
+            ;;
+        esac
+    done
+    if $DEBUG; then
+        $UP
+    else
+        $UP -d
+    fi
+
+
+    local webContainerName=$(getContainerNameByType "nginx")
+    local webHostName="$PROJECTNAME.local.com";
+    local webIp=`docker inspect -f "{{.NetworkSettings.Networks.${PROJECTNAME}_frontend.IPAddress}}" $webContainerName`
+    sudo sed -i "/$webIp/d" /etc/hosts
+    sudo sed -i "/$webHostName/d" /etc/hosts
+    hostEntry="$webIp $webHostName"
+    sudo bash -c "echo $hostEntry >> /etc/hosts"
+
+    local mysqlContainerName=$(getContainerNameByType "mysql")
+    local mysqlHostName="$PROJECTNAME-mysql.local.com"
+    local mysqlIp=`docker inspect -f "{{.NetworkSettings.Networks.${PROJECTNAME}_frontend.IPAddress}}" $mysqlContainerName`
+    if [ -z "$mysqlIp" ] | [ "$mysqlIp" == "<no value>" ]; then
+        mysqlIp=`docker inspect -f "{{.NetworkSettings.Networks.${PROJECTNAME}_backend.IPAddress}}" $mysqlContainerName`
+    fi
+    sudo sed -i "/$mysqlIp/d" /etc/hosts
+    sudo sed -i "/$mysqlHostName/d" /etc/hosts
+    hostEntry="$mysqlIp $mysqlHostName"
+    sudo bash -c "echo $hostEntry >> /etc/hosts"
+
+    printf "\n$(tput setaf 2)Project is now setup and ready for you to kick some ass \n\n"
+    printf "$(tput setaf 2)Web Access: "
+    tput sgr0
+    echo "https://$webHostName/ "
+
+    printf "$(tput setaf 2)MySQL Host:"
+    tput sgr0
+    echo " $mysqlHostName"
+    printf "$(tput setaf 2)MySQL Username:"
+    tput sgr0
+    echo " magento"
+    printf "$(tput setaf 2)MySQL Password:"
+    tput sgr0
+    echo " magento"
+    printf "$(tput setaf 2)MySQL Port:"
+    tput sgr0
+    echo " 3306"
+    printf "$(tput setaf 2)MySQL Quick Connect:"
+    tput sgr0
+    echo " mysql -h $mysqlHostName -u root -pmagento magento"
+
+    tput sgr0
+    exit
+    WEBIP=0
+
+    return 0;
+}
+
+
+start() {
+    _start $parameters;
+}
+
+update() {
+    $DOCKERCOMPOSE pull
+    $DOCKERCOMPOSE build --no-cache
+}
+
+stopAll() {
+    $DOCKER stop $($DOCKER ps -q)
+    $DOCKER network prune --force
+}
+
+stop() {
+    $DOCKERCOMPOSE stop
+    $DOCKER network rm $($DOCKER  network ls | grep "$PROJECTNAME" | awk '/ / { print $1 }')
+}
+
+restart() {
+    stop
+    start
+}
+
+status() {
+    $DOCKERCOMPOSE ps
+}
+
+stats() {
+    # check if sed is available
+    if [ -z "$SED" ];
+    then
+        echo "Stats requires 'sed'. The tool was not found on your system." >&2
+        return 1
+    fi
+
+    $DOCKER ps -q | $XARGS $DOCKER inspect --format '{{.Name}}' | $SED 's:/::' | $XARGS $DOCKER stats
+}
+
+composer() {
+    executeComposer $parameters
+}
+
+magerun() {
+    executeMagerun $parameters
+}
+
+enter() {
+    enterContainer $parameters
+}
+
+destroy() {
+    $DOCKERCOMPOSE stop
+    $DOCKERCOMPOSE rm --force
+}
+
+phpunit() {
+    executePHPUnit $parameters
+}
+
+initsampledata() {
+    executeInitSampleData $parameters
+}
+
+php() {
+    executePHP $parameters
+}
+
+access() {
+    enterFakeAccessServer $parameters
+}
+
+xdebug() {
+    executeXdebug $parameters
+}
+
+phpcs() {
+    executePhpcs $parameters;
+}
+
+mysqlClient()
+{
+    executeMysqlClient $parameters
+}
+
+executeMagento()
+{
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+
+    CMD="php bin/magento $@"
+    bash -c $containerName -u www-data -r "$CMD"
+}
+
+magento()
+{
+    executeMagento $parameters
+}
+
+executeInstallSampleData()
+{
+    local containerName=$(getContainerNameByType "php")
+    if [ -z "$containerName" ];
+    then
+        echo "Cannot determine the name of the container." >&2
+        return 1
+    fi
+
+    CMD="php bin/magento sampledata:deploy \
+        && composer update \
+        && php bin/magento setup:upgrade"
+    bash -c $containerName -u www-data -r "$CMD"
+}
+
+installSampleData()
+{
+    executeInstallSampleData $parameters;
+}
+
+executeProjectInstall()
+{
+    projectInit $parameters
+    magentoInstall $parameters
+    installSampleData $parameters
+}
+
+projectInstall()
+{
+    executeProjectInstall $parameters
+}
+
+case "$action" in
+    start)
+    start
+    ;;
+
+    stop)
+    stop
+    ;;
+
+    stopall | stopAll)
+    stopAll
+    ;;
+
+    restart)
+    restart
+    ;;
+
+    status)
+    status
+    ;;
+
+    stats)
+    stats
+    ;;
+
+    update)
+    update
+    ;;
+
+    mr | magerun)
+    magerun
+    ;;
+
+    composer)
+    composer
+    ;;
+
+    enter)
+    enter
+    ;;
+
+    destroy)
+    destroy
+    ;;
+
+    phpunit)
+    phpunit
+    ;;
+
+    dbimport)
+    dbimport
+    ;;
+
+    initsampledata)
+    initsampledata
+    ;;
+
+    php)
+    php
+    ;;
+
+    accessServer | accessserver | as | access)
+    access
+    ;;
+
+    xdebug)
+    xdebug
+    ;;
+
+    phpcs)
+    phpcs
+    ;;
+
+    mysqlclient | mysqlClient | mysql-client | mysql | my)
+    mysqlClient
+    ;;
+
+    enterXdebug | enterxdebug)
+    enterXdebug
+    ;;
+
+    testBuild | testbuild)
+    testBuild
+    ;;
+
+    projectInit | projectinit)
+    projectInit
+    ;;
+
+    magentoInstall | magentoinstall)
+    magentoInstall
+    ;;
+
+    magento | mage | m )
+    magento
+    ;;
+
+    installSampleData | installsampledata )
+    installSampleData
+    ;;
+
+    projectInstall | projectinstall )
+    projectInstall
+    ;;
+
+    *)
+    echo "usage : $0 start|stop|stopAll|restart|status|stats|update|magerun|composer|enter|destroy|phpunit|accessServer|xdebug|phpcs
+
+  start                     Starts the docker containers (and triggers the
+                            installation if Magento is not yet installed)
+  stop                      Stops projects docker containers
+  stopAll                   Stops ALL docker containers
+  restart                   Restarts all docker containers
+  status                    Prints the status of all docker containers
+  stats                     Displays live resource usage statistics of all containers
+  update                    Updates all containers based on whats defined in .docker/docker-compose.yml .docker-compose-override.yml
+  magerun | mr              Executes magerun in the PHP container as www-data user
+  composer                  Executes composer in the magento root directory
+  enter                     Enters the bash of a given container type (e.g. php, mysql)
+  accessServer | as         Enters the PHP container as www-data user
+                            You can also pass the the following to enable CLI xdebug
+                            -x | --xdebug
+  destroy                   Stops all containers and removes all data
+  phpunit                   Runs all PHPUnit tests
+  initsampledata            initialise Magento 1.x with the latest sample data
+  xdebug                    Enable and disable xdebug with './vortex xdebug enable', './vortex xdebug disable' and './vortex xdebug status'
+  phpcs
+  mysqlclient | mysql | my  Simply a short for 'mysql -u root -p magento -h $PROJECTNAME-mysql.local.com'
+  enterXdebug               Enters fake access container with PHP_IDE_CONFIG='serverName=default' set
+  testBuild                 M2 only feature which will run all the deployment commands
+  projectInit               Initialise the composer project from magento/project-community-edition
+  magentoInstall            Installs Magento 2
+  magento                   Runs php bin/magento with the PHP as the www-data user
+  installSampleData         Installs Magento 2 sample data
+  projectInstall            Calls projectInit then magentoInstall then installSampleData
+"
+    ;;
+esac
+
+exit 0

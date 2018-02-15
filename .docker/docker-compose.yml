@@ -1,0 +1,60 @@
+version: "3"
+services:
+  nginx:
+    image: vortexcommerce/nginx:latest
+    volumes:
+      - ./logs/nginx:/var/log/nginx
+      - ./config/nginx/ssl:/etc/nginx/ssl
+      - ./config/nginx/includes:/etc/nginx/includes
+      - ./config/nginx/sites-enabled:/etc/nginx/conf.d
+      - ./config/nginx/custom-includes:/etc/nginx/custom-includes
+      - ../:/var/www/html
+    networks:
+      backend:
+        aliases:
+          - nginx
+      frontend:
+        aliases:
+          - nginx
+    depends_on:
+      - php
+  php:
+    image: vortexcommerce/php:7.0-fpm
+    volumes:
+      - ../:/var/www/html
+      - ./logs/php:/var/log/php
+    networks:
+      backend:
+      frontend:
+    depends_on:
+      - mysql
+      - cache
+      - fullpagecache
+      - sessions
+  mysql:
+    image: percona:latest
+    environment:
+      MYSQL_ROOT_PASSWORD: magento
+      MYSQL_DATABASE: magento
+      MYSQL_USER: magento
+      MYSQL_PASSWORD: magento
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./config/mysql/percona-server.conf.d:/etc/mysql/percona-server.conf.d
+    networks:
+      backend:
+  cache:
+    image: redis:latest
+    networks:
+      backend:
+  fullpagecache:
+    image: redis:latest
+    networks:
+      backend:
+  sessions:
+    image: redis:latest
+    networks:
+      backend:
+networks:
+  frontend:
+  backend:

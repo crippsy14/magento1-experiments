@@ -1,0 +1,6 @@
+/composer.lock
+.DS_Store
+.idea
+/data
+/logs
+/config/nginx/ssl
